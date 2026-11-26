@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/assets/">
+    <File Path="assets/XamlAnimatedGif-128.png" />
+    <File Path="assets/XamlAnimatedGif-420.png" />
+  </Folder>
+  <Folder Name="/_/">
+    <File Path=".gitattributes" />
+    <File Path=".gitignore" />
+    <File Path="Directory.Build.props" />
+    <File Path="LICENSE.txt" />
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="XamlAnimatedGif.Demo/XamlAnimatedGif.Demo.csproj" />
+  <Project Path="XamlAnimatedGif.PlaybackTest/XamlAnimatedGif.PlaybackTest.csproj" />
+  <Project Path="XamlAnimatedGif/XamlAnimatedGif.csproj" />
+</Solution>

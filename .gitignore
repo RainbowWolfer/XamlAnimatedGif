@@ -6,5 +6,6 @@ obj/
 
 TestResults/
 artifacts/
+nupkg/
 
 _ReSharper.Caches/
