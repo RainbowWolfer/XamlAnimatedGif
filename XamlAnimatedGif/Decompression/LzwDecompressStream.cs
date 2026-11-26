@@ -48,11 +48,14 @@ namespace XamlAnimatedGif.Decompression
             while (read < count)
             {
                 int code = _reader.ReadBits(_codeTable.CodeLength);
-                
+
                 if (!ProcessCode(code, buffer, offset, count, ref read))
                 {
                     _endOfStream = true;
-                    break;
+                    // A stop code or a truncated code ends the pixel stream. The rest of this
+                    // frame stays index 0 so the caller still receives a full buffer.
+                    Array.Clear(buffer, offset + read, count - read);
+                    return count;
                 }
             }
             return read;
@@ -134,17 +137,31 @@ namespace XamlAnimatedGif.Decompression
                     InitCodeTable();
                     return true;
                 }
+                if (sequence.Bytes == null || sequence.Bytes.Length == 0)
+                    return false;
+
                 _remainingBytes = CopySequenceToBuffer(sequence.Bytes, buffer, offset, count, ref read);
-                if (_prevCode >= 0)
+                if (_prevCode >= 0 && _prevCode < _codeTable.Count)
                 {
                     var prev = _codeTable[_prevCode];
-                    var newSequence = prev.Append(sequence.Bytes[0]);
-                    _codeTable.Add(newSequence);
+                    if (prev.Bytes != null && prev.Bytes.Length > 0)
+                    {
+                        var newSequence = prev.Append(sequence.Bytes[0]);
+                        _codeTable.Add(newSequence);
+                    }
                 }
             }
             else
             {
+                // KwKwK: the code being defined is the one we are reading now.
+                // Anything else is a truncated or corrupt block; stop instead of reading a null sequence.
+                if (code != _codeTable.Count || _prevCode < 0 || _prevCode >= _codeTable.Count)
+                    return false;
+
                 var prev = _codeTable[_prevCode];
+                if (prev.Bytes == null || prev.Bytes.Length == 0)
+                    return false;
+
                 var newSequence = prev.Append(prev.Bytes[0]);
                 _codeTable.Add(newSequence);
                 _remainingBytes = CopySequenceToBuffer(newSequence.Bytes, buffer, offset, count, ref read);

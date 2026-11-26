@@ -388,7 +388,7 @@ namespace XamlAnimatedGif
             byte[] indexBuffer = null;
             if (!_cacheFrameDataInMemory)
             {
-                indexStream = await GetIndexStreamAsync(frame, cancellationToken).ConfigureAwait(false);
+                indexStream = await GetIndexStreamAsync(frameIndex, cancellationToken).ConfigureAwait(false);
 
                 indexBuffer = new byte[desc.Width * desc.Height];
                 await indexStream.ReadAllAsync(indexBuffer, 0, indexBuffer.Length, cancellationToken).ConfigureAwait(false);
@@ -581,17 +581,11 @@ namespace XamlAnimatedGif
             }
         }
 
-        private async Task<Stream> GetIndexStreamAsync(GifFrame frame, CancellationToken cancellationToken)
+        private async Task<Stream> GetIndexStreamAsync(int frameIndex, CancellationToken cancellationToken)
         {
-            var data = frame.ImageData;
-            cancellationToken.ThrowIfCancellationRequested();
-            _sourceStream.Seek(data.CompressedDataStartOffset, SeekOrigin.Begin);
-            using (var ms = new MemoryStream(_indexStreamBuffer))
-            {
-                await GifHelpers.CopyDataBlocksToStreamAsync(_sourceStream, ms, cancellationToken).ConfigureAwait(false);
-            }
-            var lzwStream = new LzwDecompressStream(_indexStreamBuffer, data.LzwMinimumCodeSize);
-            return lzwStream;
+            await GetIndexBytesAsync(frameIndex, _indexStreamBuffer, cancellationToken).ConfigureAwait(false);
+            var data = _metadata.Frames[frameIndex].ImageData;
+            return new LzwDecompressStream(_indexStreamBuffer, data.LzwMinimumCodeSize);
         }
 
         private async Task GetIndexBytesAsync(int frameIndex, byte[] buffer, CancellationToken cancellationToken)
@@ -604,6 +598,10 @@ namespace XamlAnimatedGif
             _sourceStream.Seek(startPosition, SeekOrigin.Begin);
             using var memoryStream = new MemoryStream(buffer);
             await GifHelpers.CopyDataBlocksToStreamAsync(_sourceStream, memoryStream, cancellationToken).ConfigureAwait(false);
+            // The buffer is reused and sized for the largest frame. Bytes past this frame must not be decoded.
+            int written = (int)memoryStream.Position;
+            if (written < buffer.Length)
+                Array.Clear(buffer, written, buffer.Length - written);
         }
 
         internal BitmapSource Bitmap => _bitmap;
