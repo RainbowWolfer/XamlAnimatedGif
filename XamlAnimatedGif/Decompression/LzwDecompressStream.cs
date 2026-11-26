@@ -9,17 +9,52 @@ namespace XamlAnimatedGif.Decompression
     class LzwDecompressStream : Stream
     {
         private const int MaxCodeLength = 12;
+        private const int TableSize = 1 << MaxCodeLength;
+
         private readonly BitReader _reader;
-        private readonly CodeTable _codeTable;
+        private readonly int[] _start;
+        private readonly int[] _length;
+        private byte[] _arena;
+        private int _arenaUsed;
+        private int _minimumCodeLength;
+        private int _clearCode;
+        private int _stopCode;
+        private int _count;
+        private int _codeLength;
         private int _prevCode = -1;
         private byte[] _remainingBytes;
         private bool _endOfStream;
 
-        public LzwDecompressStream(byte[] compressedBuffer, int minimumCodeLength)
+        public LzwDecompressStream()
+            : this(Array.Empty<byte>(), 0, 2)
         {
-            _reader = new BitReader(compressedBuffer);
-            _codeTable = new CodeTable(minimumCodeLength);
         }
+
+        public LzwDecompressStream(byte[] compressedBuffer, int minimumCodeLength)
+            : this(compressedBuffer, compressedBuffer.Length, minimumCodeLength)
+        {
+        }
+
+        public LzwDecompressStream(byte[] compressedBuffer, int length, int minimumCodeLength)
+        {
+            _reader = new BitReader(compressedBuffer, length);
+            _start = new int[TableSize];
+            _length = new int[TableSize];
+            _arena = new byte[256 * 1024];
+            Reset(compressedBuffer, length, minimumCodeLength);
+        }
+
+        public void Reset(byte[] compressedBuffer, int length, int minimumCodeLength)
+        {
+            _reader.Reset(compressedBuffer, length);
+            _minimumCodeLength = minimumCodeLength;
+            _clearCode = 1 << minimumCodeLength;
+            _stopCode = _clearCode + 1;
+            _endOfStream = false;
+            _remainingBytes = null;
+            ResetTable();
+        }
+
         public override void Flush()
         {
         }
@@ -47,15 +82,12 @@ namespace XamlAnimatedGif.Decompression
 
             while (read < count)
             {
-                int code = _reader.ReadBits(_codeTable.CodeLength);
+                int code = _reader.ReadBits(_codeLength);
 
                 if (!ProcessCode(code, buffer, offset, count, ref read))
                 {
                     _endOfStream = true;
-                    // A stop code or a truncated code ends the pixel stream. The rest of this
-                    // frame stays index 0 so the caller still receives a full buffer.
-                    Array.Clear(buffer, offset + read, count - read);
-                    return count;
+                    break;
                 }
             }
             return read;
@@ -83,10 +115,45 @@ namespace XamlAnimatedGif.Decompression
             set { throw new NotSupportedException(); }
         }
 
-        private void InitCodeTable()
+        private void ResetTable()
         {
-            _codeTable.Reset();
+            if (_arena.Length < _clearCode)
+                Ensure(_clearCode);
+
+            for (int i = 0; i < _clearCode; i++)
+            {
+                _start[i] = i;
+                _length[i] = 1;
+                _arena[i] = (byte)i;
+            }
+
+            // Clear and stop occupy slots but are not sequences. Roots are not added
+            // through Add, so the length stays at minimum + 1, matching the old table.
+            _count = _clearCode + 2;
+            _codeLength = _minimumCodeLength + 1;
             _prevCode = -1;
+            _arenaUsed = _clearCode;
+        }
+
+        private void Ensure(int size)
+        {
+            if (size <= _arena.Length)
+                return;
+
+            int newSize = _arena.Length;
+            while (newSize < size)
+            {
+                if (newSize > int.MaxValue / 2)
+                {
+                    newSize = size;
+                    break;
+                }
+                newSize *= 2;
+            }
+
+            byte[] bigger = new byte[newSize];
+            Buffer.BlockCopy(_arena, 0, bigger, 0, _arenaUsed);
+            _arena = bigger;
         }
 
         private static byte[] CopySequenceToBuffer(byte[] sequence, byte[] buffer, int offset, int count, ref int read)
@@ -106,7 +173,6 @@ namespace XamlAnimatedGif.Decompression
 
         private void FlushRemainingBytes(byte[] buffer, int offset, int count, ref int read)
         {
-            // If we read too many bytes last time, copy them first;
             if (_remainingBytes != null)
                 _remainingBytes = CopySequenceToBuffer(_remainingBytes, buffer, offset, count, ref read);
         }
@@ -123,146 +189,95 @@ namespace XamlAnimatedGif.Decompression
                 throw new ArgumentException("Buffer is to small to receive the requested data");
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool ProcessCode(int code, byte[] buffer, int offset, int count, ref int read)
         {
-            if (code < _codeTable.Count)
+            if ((uint)code > (uint)_count || code >= TableSize)
+                return false;
+
+            if (code == _clearCode)
             {
-                var sequence = _codeTable[code];
-                if (sequence.IsStopCode)
-                {
-                    return false;
-                }
-                if (sequence.IsClearCode)
-                {
-                    InitCodeTable();
-                    return true;
-                }
-                if (sequence.Bytes == null || sequence.Bytes.Length == 0)
-                    return false;
-
-                _remainingBytes = CopySequenceToBuffer(sequence.Bytes, buffer, offset, count, ref read);
-                if (_prevCode >= 0 && _prevCode < _codeTable.Count)
-                {
-                    var prev = _codeTable[_prevCode];
-                    if (prev.Bytes != null && prev.Bytes.Length > 0)
-                    {
-                        var newSequence = prev.Append(sequence.Bytes[0]);
-                        _codeTable.Add(newSequence);
-                    }
-                }
+                ResetTable();
+                return true;
             }
-            else
+
+            if (code == _stopCode)
+                return false;
+
+            if (code == _count)
             {
-                // KwKwK: the code being defined is the one we are reading now.
-                // Anything else is a truncated or corrupt block; stop instead of reading a null sequence.
-                if (code != _codeTable.Count || _prevCode < 0 || _prevCode >= _codeTable.Count)
+                if (_prevCode < 0 || _prevCode >= _count)
                     return false;
 
-                var prev = _codeTable[_prevCode];
-                if (prev.Bytes == null || prev.Bytes.Length == 0)
+                int slot = _count;
+                Add(_prevCode, _arena[_start[_prevCode]]);
+                if (!Emit(slot, buffer, offset, count, ref read))
                     return false;
-
-                var newSequence = prev.Append(prev.Bytes[0]);
-                _codeTable.Add(newSequence);
-                _remainingBytes = CopySequenceToBuffer(newSequence.Bytes, buffer, offset, count, ref read);
+                _prevCode = code;
+                return true;
             }
+
+            if (!Emit(code, buffer, offset, count, ref read))
+                return false;
+
+            if (_prevCode >= 0)
+                Add(_prevCode, _arena[_start[code]]);
             _prevCode = code;
             return true;
         }
 
-        struct Sequence
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void Add(int prefix, byte suffix)
         {
-            public Sequence(byte[] bytes)
-                : this()
-            {
-                Bytes = bytes;
-            }
+            if (_count >= TableSize)
+                return;
 
-            private Sequence(bool isClearCode, bool isStopCode)
-                : this()
-            {
-                IsClearCode = isClearCode;
-                IsStopCode = isStopCode;
-            }
-
-            public byte[] Bytes { get; }
-
-            public bool IsClearCode { get; }
-
-            public bool IsStopCode { get; }
-
-            public static Sequence ClearCode { get; } = new Sequence(true, false);
-
-            public static Sequence StopCode { get; } = new Sequence(false, true);
-
-            public Sequence Append(byte b)
-            {
-                var bytes = new byte[Bytes.Length + 1];
-                Bytes.CopyTo(bytes, 0);
-                bytes[Bytes.Length] = b;
-                return new Sequence(bytes);
-            }
+            int prefixLength = _length[prefix];
+            int dest = _arenaUsed;
+            Ensure(dest + prefixLength + 1);
+            Buffer.BlockCopy(_arena, _start[prefix], _arena, dest, prefixLength);
+            _arena[dest + prefixLength] = suffix;
+            _start[_count] = dest;
+            _length[_count] = prefixLength + 1;
+            _arenaUsed = dest + prefixLength + 1;
+            _count++;
+            if ((_count & (_count - 1)) == 0 && _codeLength < MaxCodeLength)
+                _codeLength++;
         }
 
-        class CodeTable
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool Emit(int code, byte[] buffer, int offset, int count, ref int read)
         {
-            private readonly int _minimumCodeLength;
-            private readonly Sequence[] _table;
-            private int _count;
-            private int _codeLength;
-
-            public CodeTable(int minimumCodeLength)
+            int length = _length[code];
+            int source = _start[code];
+            if (length == 1)
             {
-                _minimumCodeLength = minimumCodeLength;
-                _codeLength = _minimumCodeLength + 1;
-                int initialEntries = 1 << minimumCodeLength;
-                _table = new Sequence[1 << MaxCodeLength];
-                for (int i = 0; i < initialEntries; i++)
+                if (read >= count)
                 {
-                    _table[_count++] = new Sequence(new[] {(byte) i});
+                    _remainingBytes = [_arena[source]];
+                    return true;
                 }
-                Add(Sequence.ClearCode);
-                Add(Sequence.StopCode);
-            }
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            public void Reset()
-            {
-                _count = (1 << _minimumCodeLength) + 2;
-                _codeLength = _minimumCodeLength + 1;
+
+                buffer[offset + read] = _arena[source];
+                read++;
+                _remainingBytes = null;
+                return true;
             }
 
-            [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            public void Add(Sequence sequence)
+            int space = count - read;
+            int take = length <= space ? length : space;
+            Buffer.BlockCopy(_arena, source, buffer, offset + read, take);
+            read += take;
+            if (take == length)
             {
-                // Code table is full, stop adding new codes
-                if (_count >= _table.Length)
-                    return;
-
-                _table[_count++] = sequence;
-                if ((_count & (_count - 1)) == 0 && _codeLength < MaxCodeLength)
-                    _codeLength++;
+                _remainingBytes = null;
+                return true;
             }
 
-            public Sequence this[int index]
-            {
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                get
-                {
-                    return _table[index];
-                }
-            }
-
-            public int Count
-            {
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                get { return _count; }
-            }
-
-            public int CodeLength
-            {
-                [MethodImpl(MethodImplOptions.AggressiveInlining)]
-                get { return _codeLength; }
-            }
+            int remain = length - take;
+            _remainingBytes = new byte[remain];
+            Buffer.BlockCopy(_arena, source + take, _remainingBytes, 0, remain);
+            return true;
         }
     }
 }
