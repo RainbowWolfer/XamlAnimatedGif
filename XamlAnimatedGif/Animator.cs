@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Threading;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using System.Runtime.InteropServices;
@@ -23,7 +24,10 @@ namespace XamlAnimatedGif
         private readonly GifDataStream _metadata;
         private readonly Dictionary<int, GifPalette> _palettes;
         private readonly WriteableBitmap _bitmap;
+        private readonly int _width;
+        private readonly int _height;
         private readonly int _stride;
+        private readonly byte[] _frameBuffer;
         private readonly byte[] _previousBackBuffer;
         private readonly byte[] _indexStreamBuffer;
         private readonly TimingManager _timingManager;
@@ -43,7 +47,11 @@ namespace XamlAnimatedGif
             _palettes = CreatePalettes(metadata);
             _bitmap = CreateBitmap(metadata);
             var desc = metadata.Header.LogicalScreenDescriptor;
+            _width = desc.Width;
+            _height = desc.Height;
             _stride = 4 * ((desc.Width * 32 + 31) / 32);
+            // Pixel work stays on this buffer. The UI thread only copies it onto the bitmap.
+            _frameBuffer = new byte[desc.Height * _stride];
             _previousBackBuffer = new byte[desc.Height * _stride];
             _indexStreamBuffer = CreateIndexStreamBuffer(metadata, _sourceStream);
             _timingManager = CreateTimingManager(metadata, repeatBehavior);
@@ -185,13 +193,13 @@ namespace XamlAnimatedGif
         private async Task RunAsync(CancellationToken cancellationToken)
         {
             if(_loadFramesDataTask != null)
-                await _loadFramesDataTask;
+                await _loadFramesDataTask.ConfigureAwait(false);
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var timing = _timingManager.NextAsync(cancellationToken);
                 var rendering = RenderFrameAsync(CurrentFrameIndex, cancellationToken);
-                await Task.WhenAll(timing, rendering);
+                await Task.WhenAll(timing, rendering).ConfigureAwait(false);
                 if (!timing.Result)
                     break;
                 CurrentFrameIndex = (CurrentFrameIndex + 1) % FrameCount;
@@ -219,7 +227,7 @@ namespace XamlAnimatedGif
 
         protected virtual void OnCurrentFrameChanged()
         {
-            CurrentFrameChanged?.Invoke(this, EventArgs.Empty);
+            RaiseOnDispatcher(() => CurrentFrameChanged?.Invoke(this, EventArgs.Empty));
         }
 
         public event EventHandler<AnimationStartedEventArgs> AnimationStarted;
@@ -233,14 +241,32 @@ namespace XamlAnimatedGif
 
         protected virtual void OnAnimationCompleted()
         {
-            AnimationCompleted?.Invoke(this, new AnimationCompletedEventArgs(AnimationSource));
+            RaiseOnDispatcher(() => AnimationCompleted?.Invoke(this, new AnimationCompletedEventArgs(AnimationSource)));
         }
 
         public event EventHandler<AnimationErrorEventArgs> Error;
 
         protected virtual void OnError(Exception ex, AnimationErrorKind kind)
         {
-            Error?.Invoke(this, new AnimationErrorEventArgs(AnimationSource, ex, kind));
+            RaiseOnDispatcher(() => Error?.Invoke(this, new AnimationErrorEventArgs(AnimationSource, ex, kind)));
+        }
+
+        /// <summary>
+        /// Frame decoding resumes on the thread pool. Events touch WPF objects, so they go back
+        /// to the dispatcher at background priority, below input, and never via a blocking Invoke.
+        /// </summary>
+        private void RaiseOnDispatcher(Action action)
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                action();
+                return;
+            }
+
+            if (Dispatcher.HasShutdownStarted)
+                return;
+
+            _ = Dispatcher.InvokeAsync(action, DispatcherPriority.Normal);
         }
 
         public int CurrentFrameIndex
@@ -362,18 +388,20 @@ namespace XamlAnimatedGif
             byte[] indexBuffer = null;
             if (!_cacheFrameDataInMemory)
             {
-                indexStream = await GetIndexStreamAsync(frame, cancellationToken);
+                indexStream = await GetIndexStreamAsync(frame, cancellationToken).ConfigureAwait(false);
 
                 indexBuffer = new byte[desc.Width * desc.Height];
-                await indexStream.ReadAllAsync(indexBuffer, 0, indexBuffer.Length, cancellationToken);
+                await indexStream.ReadAllAsync(indexBuffer, 0, indexBuffer.Length, cancellationToken).ConfigureAwait(false);
             }
             else
             {
                 indexBuffer = _cachedFrameBytes[frameIndex];
             }
 
+            if (indexBuffer == null || _frameBuffer.Length == 0)
+                return;
+
             using (indexStream)
-            using (_bitmap.LockInScope())
             {
                 if (frameIndex < _previousFrameIndex)
                     ClearArea(_metadata.Header.LogicalScreenDescriptor);
@@ -396,7 +424,7 @@ namespace XamlAnimatedGif
 
                     if (transparencyIndex >= 0)
                     {
-                        CopyFromBitmap(lineBuffer, _bitmap, offset, bufferLength);
+                        CopyFromFrame(lineBuffer, offset, bufferLength);
                     }
 
                     for (int x = 0; x < rect.Width; x++)
@@ -408,13 +436,47 @@ namespace XamlAnimatedGif
                             WriteColor(lineBuffer, palette[index], i);
                         }
                     }
-                    CopyToBitmap(lineBuffer, _bitmap, offset, bufferLength);
+                    CopyToFrame(lineBuffer, offset, bufferLength);
                 }
-                _bitmap.AddDirtyRect(rect);
             }
 
             _previousFrame = frame;
             _previousFrameIndex = frameIndex;
+            await PublishFrameAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        private async Task PublishFrameAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Dispatcher.HasShutdownStarted)
+                return;
+
+            // The pixel loop already finished off the UI thread. This copy is the only UI work.
+            // Render is processed with the rest of the frame, unlike Background, which image
+            // loads at Normal priority can starve forever.
+            if (Dispatcher.CheckAccess())
+            {
+                CopyFrameToBitmap();
+                return;
+            }
+
+            await Dispatcher.InvokeAsync(CopyFrameToBitmap, DispatcherPriority.Render).Task.ConfigureAwait(false);
+        }
+
+        private void CopyFrameToBitmap()
+        {
+            if (_disposed)
+                return;
+
+            var desc = _metadata.Header.LogicalScreenDescriptor;
+            if (desc.Width <= 0 || desc.Height <= 0)
+                return;
+
+            using (_bitmap.LockInScope())
+            {
+                Marshal.Copy(_frameBuffer, 0, _bitmap.BackBuffer, _frameBuffer.Length);
+                _bitmap.AddDirtyRect(new Int32Rect(0, 0, desc.Width, desc.Height));
+            }
         }
 
         private static IEnumerable<int> NormalRows(int height)
@@ -449,14 +511,14 @@ namespace XamlAnimatedGif
             }
         }
 
-        private static void CopyToBitmap(byte[] buffer, WriteableBitmap bitmap, int offset, int length)
+        private void CopyToFrame(byte[] line, int offset, int length)
         {
-            Marshal.Copy(buffer, 0, bitmap.BackBuffer + offset, length);
+            Buffer.BlockCopy(line, 0, _frameBuffer, offset, length);
         }
 
-        private static void CopyFromBitmap(byte[] buffer, WriteableBitmap bitmap, int offset, int length)
+        private void CopyFromFrame(byte[] line, int offset, int length)
         {
-            Marshal.Copy(bitmap.BackBuffer + offset, buffer, 0, length);
+            Buffer.BlockCopy(_frameBuffer, offset, line, 0, length);
         }
 
         private static void WriteColor(byte[] lineBuffer, Color color, int startIndex)
@@ -487,10 +549,7 @@ namespace XamlAnimatedGif
                     }
                     case GifFrameDisposalMethod.RestorePrevious:
                     {
-                        CopyToBitmap(_previousBackBuffer, _bitmap, 0, _previousBackBuffer.Length);
-                        var desc = _metadata.Header.LogicalScreenDescriptor;
-                        var rect = new Int32Rect(0, 0, desc.Width, desc.Height);
-                        _bitmap.AddDirtyRect(rect);
+                        Buffer.BlockCopy(_previousBackBuffer, 0, _frameBuffer, 0, _frameBuffer.Length);
                         break;
                     }
                 }
@@ -499,7 +558,7 @@ namespace XamlAnimatedGif
             var gce = currentFrame.GraphicControl;
             if (gce is {DisposalMethod: GifFrameDisposalMethod.RestorePrevious})
             {
-                CopyFromBitmap(_previousBackBuffer, _bitmap, 0, _previousBackBuffer.Length);
+                Buffer.BlockCopy(_frameBuffer, 0, _previousBackBuffer, 0, _frameBuffer.Length);
             }
         }
 
@@ -510,15 +569,16 @@ namespace XamlAnimatedGif
 
         private void ClearArea(Int32Rect rect)
         {
+            if (rect.Width <= 0 || rect.Height <= 0)
+                return;
+
             int bufferLength = 4 * rect.Width;
             byte[] lineBuffer = new byte[bufferLength];
             for (int y = 0; y < rect.Height; y++)
             {
                 int offset = (rect.Y + y) * _stride + 4 * rect.X;
-                CopyToBitmap(lineBuffer, _bitmap, offset, bufferLength);
+                CopyToFrame(lineBuffer, offset, bufferLength);
             }
-
-            _bitmap.AddDirtyRect(new Int32Rect(rect.X, rect.Y, rect.Width, rect.Height));
         }
 
         private async Task<Stream> GetIndexStreamAsync(GifFrame frame, CancellationToken cancellationToken)
@@ -572,8 +632,8 @@ namespace XamlAnimatedGif
 
         private Int32Rect GetFixedUpFrameRect(GifImageDescriptor desc)
         {
-            int width = Math.Min(desc.Width, _bitmap.PixelWidth - desc.Left);
-            int height = Math.Min(desc.Height, _bitmap.PixelHeight - desc.Top);
+            int width = Math.Min(desc.Width, _width - desc.Left);
+            int height = Math.Min(desc.Height, _height - desc.Top);
             return new Int32Rect(desc.Left, desc.Top, width, height);
         }
 
@@ -645,8 +705,8 @@ namespace XamlAnimatedGif
             try
             {
                 if(_loadFramesDataTask != null)
-                    await _loadFramesDataTask;
-                await RenderFrameAsync(0, CancellationToken.None);
+                    await _loadFramesDataTask.ConfigureAwait(false);
+                await RenderFrameAsync(0, CancellationToken.None).ConfigureAwait(false);
                 CurrentFrameIndex = 0;
                 _timingManager.Pause();
             }
